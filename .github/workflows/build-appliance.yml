@@ -1,0 +1,118 @@
+name: Build PLC + SCADA lab appliance (OVA / qcow2)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]          # tag v1.0.0 -> builds and publishes a GitHub Release
+
+permissions:
+  contents: write         # needed to attach files to a Release
+
+env:
+  IMAGE: plc-scada-lab
+  BASE_URL: https://cloud.debian.org/images/cloud/bookworm/latest
+
+jobs:
+  test:
+    name: Smoke test (4 vendors + SCADA + PLC-to-PLC)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack uploaded zip (only when the repo was uploaded as a .zip)
+        run: for z in ./*.zip; do [ -f "$z" ] && unzip -oq "$z" -x '.github/*'; done; true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tests/smoke.py
+
+  build:
+    name: Build image
+    needs: test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack uploaded zip (only when the repo was uploaded as a .zip)
+        run: for z in ./*.zip; do [ -f "$z" ] && unzip -oq "$z" -x '.github/*'; done; true
+
+      - name: Enable KVM (faster libguestfs / boot test)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "KVM not available - falling back to software emulation (slow)"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libguestfs-tools qemu-utils qemu-system-x86
+          sudo chmod 0644 /boot/vmlinuz-* || true      # libguestfs needs a readable kernel
+
+      - name: Download + verify Debian 12 base image
+        run: |
+          curl -fsSLO "$BASE_URL/debian-12-generic-amd64.qcow2"
+          curl -fsSLO "$BASE_URL/SHA512SUMS"
+          grep ' debian-12-generic-amd64.qcow2$' SHA512SUMS | sha512sum -c -
+          cp debian-12-generic-amd64.qcow2 "$IMAGE.qcow2"
+
+      - name: Customize image (install simulator + SCADA, systemd units)
+        env:
+          LIBGUESTFS_BACKEND: direct
+        run: |
+          sudo -E virt-customize -a "$IMAGE.qcow2" \
+            --hostname plc-scada-lab \
+            --install python3,iproute2,isc-dhcp-client,open-vm-tools,openssh-server \
+            --mkdir /opt/plcsim --mkdir /etc/plcsim \
+            --copy-in plc_sim.py:/opt/plcsim --copy-in scada.py:/opt/plcsim \
+            --copy-in appliance/plcsim-net:/usr/local/sbin \
+            --copy-in appliance/plcsim.service:/etc/systemd/system \
+            --copy-in appliance/plcsim-net.service:/etc/systemd/system \
+            --copy-in appliance/plcs.json:/etc/plcsim \
+            --copy-in appliance/scada.json:/etc/plcsim \
+            --run-command 'chmod 755 /usr/local/sbin/plcsim-net /opt/plcsim/*.py' \
+            --run-command 'systemctl enable plcsim-net.service plcsim.service ssh.service' \
+            --run-command 'touch /etc/cloud/cloud-init.disabled; rm -f /etc/network/interfaces.d/* /etc/netplan/*.yaml' \
+            --run-command 'printf "PermitRootLogin yes\nPasswordAuthentication yes\n" > /etc/ssh/sshd_config.d/10-lab.conf' \
+            --root-password password:plcsim \
+            --copy-in appliance/motd:/etc \
+            --run-command 'apt-get clean; rm -rf /var/lib/apt/lists/*'
+
+      - name: Boot test (image must come up and serve both web UIs)
+        timeout-minutes: 15
+        run: |
+          ACCEL=""; [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host" || ACCEL="-cpu max"
+          qemu-system-x86_64 -m 2048 -smp 2 $ACCEL -display none -serial file:boot.log -daemonize \
+            -drive file="$IMAGE.qcow2",if=virtio,snapshot=on \
+            -netdev user,id=n0,hostfwd=tcp::18080-:8080,hostfwd=tcp::18090-:8090 -device virtio-net-pci,netdev=n0
+          for i in $(seq 1 90); do
+            if curl -fs localhost:18080/api/state >/dev/null && curl -fs localhost:18090/api/state >/dev/null; then echo "both UIs up"; exit 0; fi
+            sleep 8
+          done
+          echo "image did not come up"; tail -n 80 boot.log; exit 1
+
+      - name: Convert to OVA (VMware / VirtualBox) and compressed qcow2 (KVM / Proxmox)
+        run: |
+          qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized,adapter_type=lsilogic "$IMAGE.qcow2" "$IMAGE-disk1.vmdk"
+          CAP=$(qemu-img info --output=json "$IMAGE.qcow2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])')
+          python3 build/make_ova.py --vmdk "$IMAGE-disk1.vmdk" --capacity "$CAP" --name "$IMAGE" --out "$IMAGE.ova" --nics 4
+          qemu-img convert -c -f qcow2 -O qcow2 "$IMAGE.qcow2" "$IMAGE-compressed.qcow2"
+          mv "$IMAGE-compressed.qcow2" "$IMAGE.qcow2"
+          sha256sum "$IMAGE.ova" "$IMAGE.qcow2" | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plc-scada-lab-appliance
+          path: |
+            plc-scada-lab.ova
+            plc-scada-lab.qcow2
+            SHA256SUMS
+          retention-days: 14
+
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            plc-scada-lab.ova
+            plc-scada-lab.qcow2
+            SHA256SUMS
