@@ -99,7 +99,20 @@ jobs:
           mv "$IMAGE-compressed.qcow2" "$IMAGE.qcow2"
           sha256sum "$IMAGE.ova" "$IMAGE.qcow2" | tee SHA256SUMS
 
-      - name: Publish GitHub Release (works for manual runs and tags)
+      - name: Work out release tag
+        id: rel
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then T="$GITHUB_REF_NAME"; else T="build-$GITHUB_RUN_NUMBER"; fi
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }} name: PLC + SCADA lab appliance ${{ github.ref_type == 'tag' && github.ref_name || format('build {0}', github.run_number) }} target_commitish: ${{ github.sha }} body: | Import `plc-scada-lab.ova` in VMware Workstation / VirtualBox (4 NICs: NIC1 management, NIC2-4 OT). Login root / plcsim. PLC panel :8080, SCADA HMI :8090. Verify with SHA256SUMS before importing. files: | plc-scada-lab.ova plc-scada-lab.qcow2 SHA256SUMS
+          tag_name: "${{ steps.rel.outputs.tag }}"
+          name: "PLC SCADA lab appliance ${{ steps.rel.outputs.tag }}"
+          target_commitish: "${{ github.sha }}"
+          body: "Import plc-scada-lab.ova in VMware Workstation or VirtualBox. Login root / plcsim. PLC panel port 8080, SCADA HMI port 8090. Verify SHA256SUMS before importing."
+          files: |
+            plc-scada-lab.ova
+            plc-scada-lab.qcow2
+            SHA256SUMS
